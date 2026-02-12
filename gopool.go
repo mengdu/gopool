@@ -1,12 +1,19 @@
 package gopool
 
-import "sync"
+import (
+	"errors"
+	"log"
+	"sync"
+)
+
+var ErrPoolOverload = errors.New("Pool Overload")
 
 // Pool is a lightweight goroutine pool that limits the number of concurrent workers.
 type Pool struct {
-	work chan func()
-	sem  chan struct{}
-	wg   sync.WaitGroup
+	work            chan func()
+	sem             chan struct{} // pool
+	wg              sync.WaitGroup
+	WithNonblocking bool // When true, an ErrPoolOverload error will be returned when the pool is full
 }
 
 // New creates a new Pool with a maximum number of concurrent workers specified by size.
@@ -17,20 +24,32 @@ func New(size int) *Pool {
 	}
 }
 
-// Schedule schedules a task to be executed by the pool.
+// Schedule ignore blocking errors
+func (p *Pool) Schedule(task func()) {
+	p.Submit(task)
+}
+
+// Submit schedules a task to be executed by the pool.
 // If the number of workers is less than the limit, it will spawn a new worker.
 // Otherwise, the task will be queued until a worker is available.
-func (p *Pool) Schedule(task func()) {
+func (p *Pool) Submit(task func()) error {
+	p.wg.Add(1)
 	select {
-	// If a worker is already running, send the task to the work queue.
-	case p.work <- task:
-		p.wg.Add(1)
-
-	// If we haven't reached the worker limit, start a new worker goroutine.
+	// 1.If we haven't reached the worker limit, start a new worker goroutine.
 	case p.sem <- struct{}{}:
-		p.wg.Add(1)
 		go p.worker(task)
+
+	// 2.If a worker is already running, send the task to the work queue.
+	case p.work <- task:
+
+	default:
+		if p.WithNonblocking {
+			p.wg.Done()
+			return ErrPoolOverload
+		}
+		p.work <- task
 	}
+	return nil
 }
 
 // Release stops accepting new tasks and closes the work channel.
@@ -50,11 +69,25 @@ func (p *Pool) worker(task func()) {
 	defer func() { <-p.sem }()
 
 	for {
+		// if p.work closed
 		if task == nil {
 			return
 		}
-		task()
-		p.wg.Done()
+
+		// keep safe run
+		p.handle(task)
+
+		// waiting add task
 		task = <-p.work
 	}
+}
+
+func (p *Pool) handle(fn func()) {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Println("recover:", err)
+		}
+		p.wg.Done()
+	}()
+	fn()
 }
